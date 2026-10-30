@@ -34,6 +34,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	gpuv1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
+	nvidiav1alpha1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1alpha1"
+	"github.com/NVIDIA/gpu-operator/internal/allocatormode"
 	"github.com/NVIDIA/gpu-operator/internal/consts"
 	"github.com/NVIDIA/gpu-operator/internal/render"
 	"github.com/NVIDIA/gpu-operator/internal/utils"
@@ -70,7 +73,6 @@ func newStateSkel(
 	manifestDir string,
 	name string,
 	description string) (stateSkel, error) {
-
 	files, err := utils.GetFilesWithSuffix(manifestDir, render.ManifestFileSuffix...)
 	if err != nil {
 		return stateSkel{}, fmt.Errorf("failed to get files from manifest directory: %v", err)
@@ -102,6 +104,35 @@ func (s *stateSkel) renderObjects(ctx context.Context, data any) ([]*unstructure
 // state. Owner references make every object (including cluster-scoped ones) garbage
 // collected when the owning CR is deleted.
 func (s *stateSkel) syncObjects(ctx context.Context, owner metav1.Object, objs []*unstructured.Unstructured) (SyncState, error) {
+	if gc, ok := owner.(*nvidiav1alpha1.GPUCluster); ok {
+		allowDefault := true
+		policies := &gpuv1.ClusterPolicyList{}
+		if err := s.client.List(ctx, policies); err != nil {
+			return SyncStateNotReady, fmt.Errorf("resolve allocator default: %w", err)
+		}
+		for _, cp := range policies.Items {
+			if cp.CreationTimestamp.Before(&gc.CreationTimestamp) {
+				allowDefault = false
+				break
+			}
+		}
+		for _, obj := range objs {
+			if obj.GetKind() != "DaemonSet" {
+				continue
+			}
+			ds := &appsv1.DaemonSet{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, ds); err != nil {
+				return SyncStateNotReady, err
+			}
+			allocatormode.Constrain(&ds.Spec.Template.Spec, allocatormode.DRA, allowDefault)
+			converted, err := runtime.DefaultUnstructuredConverter.ToUnstructured(ds)
+			if err != nil {
+				return SyncStateNotReady, err
+			}
+			obj.Object = converted
+		}
+	}
+
 	err := s.createOrUpdateObjs(ctx, func(obj *unstructured.Unstructured) error {
 		if err := controllerutil.SetControllerReference(owner, obj, s.scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference for object: %w", err)

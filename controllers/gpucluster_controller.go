@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"github.com/NVIDIA/gpu-operator/internal/allocatormode"
 	"strings"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -104,7 +106,7 @@ func (r *GPUClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("error adding finalizer to GPUCluster %s: %w", req.NamespacedName, err)
 	}
 
-	if msg, err := r.validatePrerequisites(ctx); err != nil {
+	if msg, err := r.validatePrerequisites(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	} else if msg != "" {
 		logger.V(consts.LogLevelWarning).Info("GPUCluster prerequisite not met", "reason", msg)
@@ -128,6 +130,19 @@ func (r *GPUClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	managerStatus := r.stateManager.SyncState(ctx, instance, infoCatalog)
 
+	pendingInitialization, err := allocatorInitializationPending(ctx, r.Client, allocatormode.DRA)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if pendingInitialization && managerStatus.Status == state.SyncStateReady {
+		if err := r.updateCRStatus(ctx, instance, nvidiav1alpha1.NotReady); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.OperandNotReady, "GPU node allocator initialization has not completed"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+	}
 	if err := r.updateCRStatus(ctx, instance, nvidiav1alpha1.State(managerStatus.Status)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -193,14 +208,20 @@ func gpuClusterOperandNotReadyMessage(results []state.Result) string {
 
 // validatePrerequisites checks the cross-CR rules that gate DRA enablement, returning
 // a message describing the first unmet prerequisite or an empty string when all are met.
-func (r *GPUClusterReconciler) validatePrerequisites(ctx context.Context) (string, error) {
+func (r *GPUClusterReconciler) validatePrerequisites(ctx context.Context, instance *nvidiav1alpha1.GPUCluster) (string, error) {
 	clusterPolicies := &gpuv1.ClusterPolicyList{}
 	if err := r.List(ctx, clusterPolicies); err != nil {
 		return "", fmt.Errorf("error listing ClusterPolicy objects: %w", err)
 	}
-	// TODO: relax this prerequisite once ClusterPolicy and GPUCluster can co-exist
+	// A legacy driver DaemonSet cannot serve a coexistence installation.
 	if clusterPolicy := getSingletonClusterPolicy(clusterPolicies.Items); clusterPolicy != nil {
-		return fmt.Sprintf("A ClusterPolicy CR %q exists; a ClusterPolicy CR and GPUCluster CR may not exist at the same time", clusterPolicy.Name), nil
+		if clusterPolicyCreationOrderConflict(clusterPolicy, instance) {
+			return "", nil
+		}
+		if clusterPolicy.Spec.Driver.IsEnabled() && !clusterPolicy.Spec.Driver.UseNvidiaDriverCRDType() {
+			return "Coexistence requires independent NVIDIADriver ownership or host-installed drivers", nil
+		}
+		return "", nil
 	}
 	return "", nil
 }
@@ -353,6 +374,28 @@ func (r *GPUClusterReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Ma
 	),
 	)
 	if err != nil {
+		return err
+	}
+
+	// CR changes alter which stack owns the absent-mode default. Node initialization
+	// events unblock readiness without waiting for the periodic resync.
+	if err := c.Watch(source.Kind(mgr.GetCache(), &gpuv1.ClusterPolicy{},
+		handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, _ *gpuv1.ClusterPolicy) []reconcile.Request {
+			return r.enqueueAllGPUClusters(ctx, nil)
+		}),
+		predicate.TypedGenerationChangedPredicate[*gpuv1.ClusterPolicy]{})); err != nil {
+		return err
+	}
+	if err := c.Watch(source.Kind(mgr.GetCache(), &corev1.Node{},
+		handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, _ *corev1.Node) []reconcile.Request {
+			return r.enqueueAllGPUClusters(ctx, nil)
+		}),
+		predicate.TypedFuncs[*corev1.Node]{
+			CreateFunc: func(e event.TypedCreateEvent[*corev1.Node]) bool { return hasGPULabels(e.Object.Labels) },
+			UpdateFunc: func(e event.TypedUpdateEvent[*corev1.Node]) bool {
+				return e.ObjectOld.Annotations[allocatormode.InitializedAnnotation] != e.ObjectNew.Annotations[allocatormode.InitializedAnnotation] || e.ObjectOld.Labels[commonGPULabelKey] != e.ObjectNew.Labels[commonGPULabelKey] || e.ObjectOld.Labels[allocatormode.Label] != e.ObjectNew.Labels[allocatormode.Label]
+			},
+		})); err != nil {
 		return err
 	}
 
