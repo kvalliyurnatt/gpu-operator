@@ -407,6 +407,20 @@ func (r *UpgradeReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manag
 		return err
 	}
 
+	// GPUCluster cache updates can change ClusterPolicy eligibility after admission.
+	gcMapFn := func(ctx context.Context, gc *nvidiav1alpha1.GPUCluster) []reconcile.Request {
+		return mapToSingleton(ctx, gc)
+	}
+	err = c.Watch(source.Kind(
+		mgr.GetCache(),
+		&nvidiav1alpha1.GPUCluster{},
+		handler.TypedEnqueueRequestsFromMapFunc(gcMapFn),
+		predicate.TypedGenerationChangedPredicate[*nvidiav1alpha1.GPUCluster]{}),
+	)
+	if err != nil {
+		return err
+	}
+
 	// Watch NVIDIADriver so upgradePolicy changes are reconciled even with no ClusterPolicy.
 	nvdMapFn := func(ctx context.Context, nd *nvidiav1alpha1.NVIDIADriver) []reconcile.Request {
 		return mapToSingleton(ctx, nd)

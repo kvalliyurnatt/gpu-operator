@@ -40,7 +40,7 @@ func TestResolveActiveConfig(t *testing.T) {
 	require.NoError(t, nvidiav1alpha1.AddToScheme(scheme))
 
 	clusterPolicy := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
-	gpuCluster := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster-config"}}
+	gpuCluster := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster-config", CreationTimestamp: metav1.Unix(2, 0)}}
 
 	t.Run("both CRs present are both returned", func(t *testing.T) {
 		c := fake.NewClientBuilder().WithScheme(scheme).
@@ -135,4 +135,30 @@ func TestResolveActiveConfig(t *testing.T) {
 		assert.Nil(t, cp)
 		assert.Nil(t, gc)
 	})
+}
+
+func TestResolveActiveConfigCreationOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cpDay  int
+		wantCP bool
+	}{
+		{name: "older ClusterPolicy is eligible", cpDay: 1, wantCP: true},
+		{name: "equal timestamps exclude ClusterPolicy", cpDay: 2},
+		{name: "newer ClusterPolicy is excluded", cpDay: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, gpuv1.AddToScheme(scheme))
+			require.NoError(t, nvidiav1alpha1.AddToScheme(scheme))
+			cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy", CreationTimestamp: metav1.Date(2026, 1, tc.cpDay, 0, 0, 0, 0, time.UTC)}}
+			gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "gpu-cluster", CreationTimestamp: metav1.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cp, gc).Build()
+			activeCP, activeGC, err := resolveActiveConfig(t.Context(), c)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantCP, activeCP != nil)
+			require.NotNil(t, activeGC)
+			require.Equal(t, gc.Name, activeGC.Name)
+		})
+	}
 }

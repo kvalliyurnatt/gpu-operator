@@ -24,7 +24,6 @@ import (
 
 	"github.com/NVIDIA/k8s-operator-libs/pkg/upgrade"
 	"github.com/go-logr/logr"
-
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
-
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -119,6 +117,27 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return reconcile.Result{}, err
 	}
 
+	// Admission uses a separate parameter cache. Enforce creation order again when
+	// the manager cache observes both CRs, before initializing any operand states.
+	gpuClusters := &nvidiav1alpha1.GPUClusterList{}
+	if err := r.List(ctx, gpuClusters); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list GPUCluster objects: %w", err)
+	}
+	if len(gpuClusters.Items) > 0 && clusterPolicyCreationOrderConflict(instance, &gpuClusters.Items[0]) {
+		message := fmt.Sprintf("ClusterPolicy %q must be created before GPUCluster %q; its creation timestamp is equal to or later than GPUCluster", instance.Name, gpuClusters.Items[0].Name)
+		if instance.Status.State != gpuv1.NotReady {
+			instance.SetStatus(gpuv1.NotReady, clusterPolicyCtrl.operatorNamespace)
+			if err := r.Status().Update(ctx, instance); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to mark ClusterPolicy NotReady: %w", err)
+			}
+		}
+		if err := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.PrerequisiteNotMet, message); err != nil {
+			return ctrl.Result{}, err
+		}
+		clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusNotReady)
+		return ctrl.Result{}, nil
+	}
+
 	// The ClusterPolicy with the oldest creationTimestamp (name as tie-breaker) is
 	// treated as the singleton, so the choice is stable across operator restarts and
 	// derivable by other controllers (see getSingletonClusterPolicy).
@@ -133,22 +152,15 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	// TODO: remove the below code block once both ClusterPolicy and GPUCluster can co-exist
-	gpuClusters := &nvidiav1alpha1.GPUClusterList{}
-	if err := r.List(ctx, gpuClusters); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to list GPUCluster objects: %w", err)
-	}
-	if len(gpuClusters.Items) > 0 {
-		err := fmt.Errorf("conflicting GPUCluster resource %q detected; ClusterPolicy and GPUCluster cannot co-exist", gpuClusters.Items[0].Name)
-		logger.Error(err, "only one CR may be present at a time")
+	// Coexistence requires independent driver ownership.
+	if len(gpuClusters.Items) > 0 && instance.Spec.Driver.IsEnabled() && !instance.Spec.Driver.UseNvidiaDriverCRDType() {
+		err := fmt.Errorf("coexistence requires independent NVIDIADriver ownership or host-installed drivers")
 		updateCRState(ctx, r, req.NamespacedName, gpuv1.NotReady)
-		if condErr := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.ReconcileFailed, err.Error()); condErr != nil {
+		if condErr := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.PrerequisiteNotMet, err.Error()); condErr != nil {
 			logger.Error(condErr, "failed to set condition")
 		}
-		clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusClusterPolicyUnavailable)
 		return ctrl.Result{}, err
 	}
-
 	if err := clusterPolicyCtrl.init(ctx, r, instance); err != nil {
 		logger.Error(err, "unable to initialize ClusterPolicy controller")
 		updateCRState(ctx, r, req.NamespacedName, gpuv1.NotReady)
@@ -496,7 +508,7 @@ func (r *ClusterPolicyReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		return err
 	}
 
-	// Watch GPUCluster: its existence gates the resource-allocation mode nodeSelector on operands.
+	// Reevaluate creation order and driver prerequisites when GPUCluster becomes visible or is deleted.
 	gpuClusterMapFn := func(ctx context.Context, _ *nvidiav1alpha1.GPUCluster) []reconcile.Request {
 		return r.enqueueAllClusterPolicies(ctx)
 	}

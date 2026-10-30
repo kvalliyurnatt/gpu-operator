@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"testing"
 
@@ -164,7 +165,7 @@ func TestGPUClusterReconcileRecordsGPUNodeCount(t *testing.T) {
 // before any state is synced.
 func TestGPUClusterReconcileRecordsGPUNodeCountWithConflict(t *testing.T) {
 	cfg := &nvidiav1alpha1.GPUCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "config"},
+		ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.Unix(2, 0)},
 	}
 	cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
 	gpuNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
@@ -324,9 +325,9 @@ func TestGPUClusterTeardownDrainsClaimConsumersFirst(t *testing.T) {
 	require.NoError(t, c.Get(t.Context(), types.NamespacedName{Name: plugin.Name, Namespace: "test-namespace"}, ds))
 }
 
-// A ClusterPolicy and GPUCluster CR cannot co-exist
+// An older ClusterPolicy using the legacy driver blocks GPUCluster reconciliation.
 func TestGPUClusterCoexistsWithClusterPolicy(t *testing.T) {
-	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.Unix(2, 0)}}
 	cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
 	r, c := newGPUClusterReconciler(t, cfg, cp)
 
@@ -351,4 +352,25 @@ func TestEnqueueAllGPUClusters(t *testing.T) {
 	got := []string{requests[0].String(), requests[1].String()}
 	sort.Strings(got)
 	require.Equal(t, []string{"/config-a", "/config-b"}, got)
+}
+
+func TestGPUClusterWithDelegatedClusterPolicy(t *testing.T) {
+	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.Unix(2, 0)}}
+	cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
+	cp.Spec.Driver.UseNvidiaDriverCRD = new(true)
+	r, c := newGPUClusterReconciler(t, cfg, cp)
+	gccReconcile(t, r, cfg.Name)
+	require.Equal(t, nvidiav1alpha1.Ready, gccState(t, c, cfg.Name))
+}
+
+func TestGPUClusterIgnoresRejectedClusterPolicy(t *testing.T) {
+	for _, cpSecond := range []int64{2, 3} {
+		t.Run(fmt.Sprintf("ClusterPolicy timestamp %d", cpSecond), func(t *testing.T) {
+			gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "gpu-cluster", CreationTimestamp: metav1.Unix(2, 0)}}
+			cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cp", CreationTimestamp: metav1.Unix(cpSecond, 0)}}
+			r, c := newGPUClusterReconciler(t, gc, cp)
+			gccReconcile(t, r, gc.Name)
+			require.Equal(t, nvidiav1alpha1.Ready, gccState(t, c, gc.Name), "rejected legacy ClusterPolicy must not block GPUCluster")
+		})
+	}
 }

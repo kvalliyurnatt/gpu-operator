@@ -26,6 +26,7 @@ import (
 	promcli "github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -34,6 +35,7 @@ import (
 
 	gpuv1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
 	nvidiav1alpha1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1alpha1"
+	"github.com/NVIDIA/gpu-operator/internal/conditions"
 	gpuconsts "github.com/NVIDIA/gpu-operator/internal/consts"
 )
 
@@ -443,16 +445,16 @@ func TestClusterPolicyReconcileSkipsNonSingleton(t *testing.T) {
 	require.Equal(t, gpuv1.Ready, clusterPolicyState(t, c, older.Name))
 }
 
-func TestClusterPolicyBlockedByGPUCluster(t *testing.T) {
-	cp := clusterPolicyForUpgradeTest(true)
+func TestClusterPolicyWithLegacyDriverBlockedByGPUCluster(t *testing.T) {
+	cp := clusterPolicyForUpgradeTest(false)
 	r, c, _ := newClusterPolicyUpgradeTestReconciler(t, cp)
 
-	gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+	gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.Unix(2, 0)}}
 	require.NoError(t, c.Create(t.Context(), gc))
 
 	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cp)})
 	require.Equal(t, gpuv1.NotReady, clusterPolicyState(t, c, cp.Name))
-	require.ErrorContains(t, err, "ClusterPolicy and GPUCluster cannot co-exist")
+	require.ErrorContains(t, err, "coexistence requires independent NVIDIADriver ownership")
 
 	// Deleting the GPUCluster instance unblocks the next reconcile
 	require.NoError(t, c.Delete(t.Context(), gc))
@@ -513,4 +515,88 @@ func clusterPolicyState(t *testing.T, c client.Client, name string) gpuv1.State 
 	cp := &gpuv1.ClusterPolicy{}
 	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cp))
 	return cp.Status.State
+}
+
+func TestClusterPolicyCoexistsWithGPUCluster(t *testing.T) {
+	cp := clusterPolicyForUpgradeTest(true)
+	r, c, _ := newClusterPolicyUpgradeTestReconciler(t, cp)
+	require.NoError(t, c.Create(t.Context(), &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.Unix(2, 0)}}))
+	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cp)})
+	require.NoError(t, err)
+	require.Equal(t, gpuv1.Ready, clusterPolicyState(t, c, cp.Name))
+}
+
+func TestClusterPolicyCreationOrderGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cpDay   int
+		blocked bool
+	}{
+		{name: "older ClusterPolicy reconciles", cpDay: 1},
+		{name: "equal timestamps reject ClusterPolicy", cpDay: 2, blocked: true},
+		{name: "newer ClusterPolicy is rejected", cpDay: 3, blocked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := clusterPolicyForUpgradeTest(true)
+			cp.CreationTimestamp = metav1.Date(2026, 1, tc.cpDay, 0, 0, 0, 0, time.UTC)
+			r, c, _ := newClusterPolicyUpgradeTestReconciler(t, cp)
+			r.conditionUpdater = conditions.NewClusterPolicyUpdater(c)
+			gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "gpu-cluster", CreationTimestamp: metav1.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}}
+			require.NoError(t, c.Create(t.Context(), gc))
+			calls := 0
+			clusterPolicyCtrl.controls = []controlFunc{{func(ClusterPolicyController) (gpuv1.State, error) {
+				calls++
+				return gpuv1.Ready, nil
+			}}}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cp)}
+			_, err := r.Reconcile(t.Context(), req)
+			require.NoError(t, err)
+			actual := &gpuv1.ClusterPolicy{}
+			require.NoError(t, c.Get(t.Context(), req.NamespacedName, actual))
+			if !tc.blocked {
+				require.Equal(t, gpuv1.Ready, actual.Status.State)
+				require.Equal(t, 1, calls)
+				return
+			}
+			require.Equal(t, gpuv1.NotReady, actual.Status.State)
+			require.Zero(t, calls, "rejected ClusterPolicy must not run operand states")
+			errorCondition := meta.FindStatusCondition(actual.Status.Conditions, conditions.Error)
+			require.NotNil(t, errorCondition)
+			require.Equal(t, metav1.ConditionTrue, errorCondition.Status)
+			require.Equal(t, conditions.PrerequisiteNotMet, errorCondition.Reason)
+			require.Contains(t, errorCondition.Message, "must be created before GPUCluster")
+			require.Equal(t, metav1.ConditionFalse, meta.FindStatusCondition(actual.Status.Conditions, conditions.Ready).Status)
+			// The backstop follows currently observed CRs; deleting GPUCluster clears the error.
+			require.NoError(t, c.Delete(t.Context(), gc))
+			_, err = r.Reconcile(t.Context(), req)
+			require.NoError(t, err)
+			require.NoError(t, c.Get(t.Context(), req.NamespacedName, actual))
+			require.Equal(t, gpuv1.Ready, actual.Status.State)
+			require.Equal(t, 1, calls)
+			require.Equal(t, metav1.ConditionFalse, meta.FindStatusCondition(actual.Status.Conditions, conditions.Error).Status)
+		})
+	}
+}
+
+func TestClusterPolicyCreationOrderGuardAfterCacheCatchup(t *testing.T) {
+	cp := clusterPolicyForUpgradeTest(true)
+	cp.CreationTimestamp = metav1.Unix(3, 0)
+	r, c, _ := newClusterPolicyUpgradeTestReconciler(t, cp)
+	r.conditionUpdater = conditions.NewClusterPolicyUpdater(c)
+	calls := 0
+	clusterPolicyCtrl.controls = []controlFunc{{func(ClusterPolicyController) (gpuv1.State, error) {
+		calls++
+		return gpuv1.Ready, nil
+	}}}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cp)}
+	_, err := r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, gpuv1.Ready, clusterPolicyState(t, c, cp.Name))
+	// Making the older GPUCluster visible simulates the manager cache catching up.
+	gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "gpu-cluster", CreationTimestamp: metav1.Unix(2, 0)}}
+	require.NoError(t, c.Create(t.Context(), gc))
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, gpuv1.NotReady, clusterPolicyState(t, c, cp.Name))
+	require.Equal(t, 1, calls, "cache catchup must stop further operand reconciliation")
 }

@@ -78,6 +78,8 @@ validator:
     env: []
 
 operator:
+  # Holds nodes without mode or allocator deployment-label history, with one or both CRs.
+  requireExplicitAllocatorModeForNewNodes: false
   repository: nvcr.io/nvidia
   image: gpu-operator
   # If version is not specified, then default is to use chart.AppVersion

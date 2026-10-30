@@ -27,7 +27,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
-	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -40,11 +39,6 @@ import (
 	nvidiav1alpha1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1alpha1"
 	"github.com/NVIDIA/gpu-operator/internal/consts"
 )
-
-// podNodeNameIndexer mirrors the manager's spec.nodeName pod index for fake clients.
-func podNodeNameIndexer(obj client.Object) []string {
-	return []string{obj.(*corev1.Pod).Spec.NodeName}
-}
 
 // mergeLabels merges multiple label maps into one (last write wins).
 func mergeLabels(labels ...map[string]string) map[string]string {
@@ -468,7 +462,7 @@ func TestUpdateGPUStateLabels(t *testing.T) {
 			expectedLabels: map[string]string{},
 		},
 		{
-			name:          "no common GPU label, all state labels removed, non-state labels preserved",
+			name:          "no common GPU label, all deployment labels removed and unrelated labels preserved",
 			clusterPolicy: &gpuv1.ClusterPolicy{},
 			initialLabels: map[string]string{
 				"nvidia.com/gpu.deploy.driver":        "true",
@@ -506,7 +500,7 @@ func TestUpdateGPUStateLabels(t *testing.T) {
 			),
 		},
 		{
-			name:          "operands disabled, all state labels removed",
+			name:          "ClusterPolicy operands disabled, deployment labels and allocator history removed",
 			clusterPolicy: &gpuv1.ClusterPolicy{},
 			initialLabels: mergeLabels(
 				map[string]string{
@@ -731,7 +725,7 @@ func TestUpdateGPUStateLabelsDispatch(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			nlc := &nodeLabelingController{
-				client:        fake.NewClientBuilder().WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).Build(),
+				client:        fake.NewClientBuilder().Build(),
 				clusterPolicy: tc.clusterPolicy,
 				gpuCluster:    tc.gpuCluster,
 				logger:        logr.Discard(),
@@ -809,7 +803,7 @@ func TestUpdateGPUStateLabelsModeSweep(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			nlc := &nodeLabelingController{
-				client:        fake.NewClientBuilder().WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).Build(),
+				client:        fake.NewClientBuilder().Build(),
 				clusterPolicy: tc.clusterPolicy,
 				gpuCluster:    tc.gpuCluster,
 				logger:        logr.Discard(),
@@ -819,106 +813,6 @@ func TestUpdateGPUStateLabelsModeSweep(t *testing.T) {
 			assert.Equal(t, tc.expectedLabels, labels)
 		})
 	}
-}
-
-// TestDeferDRAPluginRemoval covers the drain-last guard: on a node flipped from dra to
-// device-plugin, gpu.deploy.dra-driver is removed only once no pod on the node holds a
-// gpu.nvidia.com ResourceClaim, so the kubelet-plugin outlives its claim holders.
-func TestDeferDRAPluginRemoval(t *testing.T) {
-	scheme := runtime.NewScheme()
-	require.NoError(t, corev1.AddToScheme(scheme))
-	require.NoError(t, resourcev1.AddToScheme(scheme))
-
-	gpuClaim := &resourcev1.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "gpu-claim", Namespace: "default"},
-		Status: resourcev1.ResourceClaimStatus{
-			Allocation: &resourcev1.AllocationResult{
-				Devices: resourcev1.DeviceAllocationResult{
-					Results: []resourcev1.DeviceRequestAllocationResult{
-						{Request: "gpu", Driver: "gpu.nvidia.com", Pool: "pool", Device: "gpu-0"},
-					},
-				},
-			},
-		},
-	}
-	claimPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "claim-pod", Namespace: "default"},
-		Spec: corev1.PodSpec{
-			NodeName: "test-node",
-			ResourceClaims: []corev1.PodResourceClaim{
-				{Name: "gpu", ResourceClaimName: new("gpu-claim")},
-			},
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
-	}
-
-	// flippedNodeLabels simulates a node that was on the DRA stack and is being switched
-	// to the device-plugin stack (GPUCluster deleted, ClusterPolicy now active). The node
-	// still carries DRA state labels from the previous stack.
-	flippedNodeLabels := func() map[string]string {
-		return mergeLabels(map[string]string{commonGPULabelKey: commonGPULabelValue}, gpuClusterStateLabels)
-	}
-
-	t.Run("claim pod on node defers plugin label removal", func(t *testing.T) {
-		nlc := &nodeLabelingController{
-			client:        fake.NewClientBuilder().WithScheme(scheme).WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).WithObjects(gpuClaim.DeepCopy(), claimPod.DeepCopy()).Build(),
-			clusterPolicy: &gpuv1.ClusterPolicy{},
-			logger:        logr.Discard(),
-		}
-		labels := flippedNodeLabels()
-		nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
-		assert.Equal(t, "true", labels[draDriverDeployLabelKey], "plugin label must survive while claim pods remain")
-		assert.NotContains(t, labels, draValidatorDeployLabelKey, "claim-holder operand labels sweep immediately")
-		assert.True(t, nlc.draPluginRemovalDeferred)
-	})
-
-	t.Run("admin-access claim pod defers plugin label removal", func(t *testing.T) {
-		// The operands hold admin-access claims: excluded from upgrade eviction, but
-		// unpreparing them still needs the kubelet-plugin, so they must defer its removal.
-		adminClaim := gpuClaim.DeepCopy()
-		adminClaim.Name = "admin-claim"
-		adminClaim.Status.Allocation.Devices.Results[0].AdminAccess = new(true)
-		adminPod := claimPod.DeepCopy()
-		adminPod.Name = "admin-pod"
-		adminPod.Spec.ResourceClaims[0].ResourceClaimName = new("admin-claim")
-		nlc := &nodeLabelingController{
-			client:        fake.NewClientBuilder().WithScheme(scheme).WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).WithObjects(adminClaim, adminPod).Build(),
-			clusterPolicy: &gpuv1.ClusterPolicy{},
-			logger:        logr.Discard(),
-		}
-		labels := flippedNodeLabels()
-		nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
-		assert.Equal(t, "true", labels[draDriverDeployLabelKey], "plugin label must survive while admin-claim pods remain")
-		assert.True(t, nlc.draPluginRemovalDeferred)
-	})
-
-	t.Run("no claim pods removes plugin label", func(t *testing.T) {
-		nlc := &nodeLabelingController{
-			client:        fake.NewClientBuilder().WithScheme(scheme).WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).Build(),
-			clusterPolicy: &gpuv1.ClusterPolicy{},
-			logger:        logr.Discard(),
-		}
-		labels := flippedNodeLabels()
-		nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
-		assert.NotContains(t, labels, draDriverDeployLabelKey)
-		assert.False(t, nlc.draPluginRemovalDeferred)
-	})
-
-	t.Run("terminating claim pod still defers", func(t *testing.T) {
-		terminating := claimPod.DeepCopy()
-		now := metav1.Now()
-		terminating.DeletionTimestamp = &now
-		terminating.Finalizers = []string{"test/keep"}
-		nlc := &nodeLabelingController{
-			client:        fake.NewClientBuilder().WithScheme(scheme).WithIndex(&corev1.Pod{}, podNodeNameIndexKey, podNodeNameIndexer).WithObjects(gpuClaim.DeepCopy(), terminating).Build(),
-			clusterPolicy: &gpuv1.ClusterPolicy{},
-			logger:        logr.Discard(),
-		}
-		labels := flippedNodeLabels()
-		nlc.updateGPUStateLabels(context.Background(), labels, "test-node")
-		assert.Equal(t, "true", labels[draDriverDeployLabelKey])
-		assert.True(t, nlc.draPluginRemovalDeferred)
-	})
 }
 
 func TestModeSweepDeleteSets(t *testing.T) {
@@ -1354,7 +1248,7 @@ func TestReconcileGPUClusterNodeLabels(t *testing.T) {
 		assert.NotContains(t, node.Labels, draDriverDeployLabelKey)
 	})
 
-	t.Run("no ClusterPolicy and no GPUCluster leaves the node untouched", func(t *testing.T) {
+	t.Run("no stack CR reconciles discovery without initializing allocator history", func(t *testing.T) {
 		r, c := newReconciler(gpuNode())
 
 		_, err := r.Reconcile(context.Background(), reconcile.Request{})
@@ -1362,16 +1256,16 @@ func TestReconcileGPUClusterNodeLabels(t *testing.T) {
 
 		node := &corev1.Node{}
 		require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "gpu-node"}, node))
-		assert.NotContains(t, node.Labels, commonGPULabelKey)
+		assert.Equal(t, commonGPULabelValue, node.Labels[commonGPULabelKey])
 		assert.NotContains(t, node.Labels, draDriverDeployLabelKey)
 	})
 
-	t.Run("both CRs present returns an error", func(t *testing.T) {
+	t.Run("both CRs with legacy drivers require independent driver ownership", func(t *testing.T) {
 		cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
-		gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+		gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.Unix(2, 0)}}
 		r, _ := newReconciler(cp, gc, gpuNode())
 
 		_, err := r.Reconcile(context.Background(), reconcile.Request{})
-		require.ErrorContains(t, err, "both ClusterPolicy and GPUCluster CRs exist")
+		require.ErrorContains(t, err, "coexistence requires independent NVIDIADriver ownership")
 	})
 }

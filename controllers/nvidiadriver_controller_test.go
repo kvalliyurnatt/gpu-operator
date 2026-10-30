@@ -206,7 +206,7 @@ func TestReconcile(t *testing.T) {
 			// Initialize fake client with ClusterPolicy (driver optional)
 			clientBuilder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cp, driver)
 			if tc.gpuClusterExists {
-				gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+				gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.Unix(2, 0)}}
 				clientBuilder = clientBuilder.WithObjects(gc)
 			}
 			client := clientBuilder.Build()
@@ -262,8 +262,11 @@ func TestReconcileStandalone(t *testing.T) {
 		},
 	}
 	gpuCluster := &nvidiav1alpha1.GPUCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "gpu-cluster-config"},
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-cluster-config", CreationTimestamp: metav1.Unix(2, 0)},
 	}
+	rejectedCP := cp.DeepCopy()
+	rejectedCP.CreationTimestamp = metav1.Unix(3, 0)
+	rejectedCP.Spec.Driver.UseNvidiaDriverCRD = new(false)
 
 	tests := []struct {
 		name             string
@@ -284,6 +287,11 @@ func TestReconcileStandalone(t *testing.T) {
 			name:             "ClusterPolicy only, host root from spec.hostPaths.rootFS",
 			objects:          []client.Object{cp},
 			expectedHostRoot: "/cp-root",
+		},
+		{
+			name:             "rejected legacy ClusterPolicy does not disable independent drivers",
+			objects:          []client.Object{rejectedCP, gpuCluster},
+			expectedHostRoot: "/",
 		},
 		{
 			name:             "neither ClusterPolicy nor GPUCluster, host root defaults to /",

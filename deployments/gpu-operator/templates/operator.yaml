@@ -70,6 +70,8 @@ spec:
         - --pprof-bind-address={{ .Values.operator.pprof.bindAddress }}
       {{- end }}
         env:
+        - name: GPU_OPERATOR_REQUIRE_EXPLICIT_ALLOCATOR_MODE_FOR_NEW_NODES
+          value: {{ .Values.operator.requireExplicitAllocatorModeForNewNodes | quote }}
         - name: WATCH_NAMESPACE
           value: ""
         - name: OPERATOR_NAMESPACE

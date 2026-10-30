@@ -275,6 +275,20 @@ func TestUpgradeReconcileNVIDIADriverWithoutClusterPolicy(t *testing.T) {
 	assert.True(t, stateManager.appliedPolicies[0].AutoUpgrade, "nil upgradePolicy must default to autoUpgrade enabled")
 }
 
+func TestUpgradeIgnoresRejectedClusterPolicy(t *testing.T) {
+	cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cp", CreationTimestamp: metav1.Unix(3, 0)}}
+	cp.Spec.Driver.UpgradePolicy = &upgrade_v1alpha1.DriverUpgradePolicySpec{AutoUpgrade: true}
+	gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "gpu-cluster", CreationTimestamp: metav1.Unix(2, 0)}}
+	nvd := &nvidiav1alpha1.NVIDIADriver{ObjectMeta: metav1.ObjectMeta{Name: "gpu-driver"}}
+	node := nodeWithUpgradeState("node-1", nvd.Name)
+	r, stateManager := newTestUpgradeReconciler(t, cp, gc, nvd, node)
+	stateManager.state.NodeStates["upgrade-required"] = []*upgrade.NodeUpgradeState{{Node: node}}
+	_, err := r.Reconcile(t.Context(), upgradeSingletonRequest())
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{AppComponentLabelKey: DriverAppComponentLabelValue}, stateManager.buildLabels)
+	require.Len(t, stateManager.appliedPolicies, 1)
+}
+
 func TestUpgradeReconcileNVIDIADriverAutoUpgradeDisabledScope(t *testing.T) {
 	enabled := &nvidiav1alpha1.NVIDIADriver{ObjectMeta: metav1.ObjectMeta{Name: "enabled-driver"}}
 	disabled := &nvidiav1alpha1.NVIDIADriver{

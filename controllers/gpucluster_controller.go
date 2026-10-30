@@ -104,7 +104,7 @@ func (r *GPUClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("error adding finalizer to GPUCluster %s: %w", req.NamespacedName, err)
 	}
 
-	if msg, err := r.validatePrerequisites(ctx); err != nil {
+	if msg, err := r.validatePrerequisites(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	} else if msg != "" {
 		logger.V(consts.LogLevelWarning).Info("GPUCluster prerequisite not met", "reason", msg)
@@ -193,14 +193,20 @@ func gpuClusterOperandNotReadyMessage(results []state.Result) string {
 
 // validatePrerequisites checks the cross-CR rules that gate DRA enablement, returning
 // a message describing the first unmet prerequisite or an empty string when all are met.
-func (r *GPUClusterReconciler) validatePrerequisites(ctx context.Context) (string, error) {
+func (r *GPUClusterReconciler) validatePrerequisites(ctx context.Context, instance *nvidiav1alpha1.GPUCluster) (string, error) {
 	clusterPolicies := &gpuv1.ClusterPolicyList{}
 	if err := r.List(ctx, clusterPolicies); err != nil {
 		return "", fmt.Errorf("error listing ClusterPolicy objects: %w", err)
 	}
-	// TODO: relax this prerequisite once ClusterPolicy and GPUCluster can co-exist
+	// A legacy driver DaemonSet cannot serve a coexistence installation.
 	if clusterPolicy := getSingletonClusterPolicy(clusterPolicies.Items); clusterPolicy != nil {
-		return fmt.Sprintf("A ClusterPolicy CR %q exists; a ClusterPolicy CR and GPUCluster CR may not exist at the same time", clusterPolicy.Name), nil
+		if clusterPolicyCreationOrderConflict(clusterPolicy, instance) {
+			return "", nil
+		}
+		if clusterPolicy.Spec.Driver.IsEnabled() && !clusterPolicy.Spec.Driver.UseNvidiaDriverCRDType() {
+			return "Coexistence requires independent NVIDIADriver ownership or host-installed drivers", nil
+		}
+		return "", nil
 	}
 	return "", nil
 }

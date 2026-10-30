@@ -52,8 +52,14 @@ func getSingletonClusterPolicy(items []gpuv1.ClusterPolicy) *gpuv1.ClusterPolicy
 	return active
 }
 
-// resolveActiveConfig returns the active ClusterPolicy, selected with the same
-// getSingletonClusterPolicy rule the ClusterPolicy controller uses, and the GPUCluster.
+// clusterPolicyCreationOrderConflict also rejects equal timestamps: creationTimestamp
+// has second precision, so a tie cannot establish that ClusterPolicy was created first.
+func clusterPolicyCreationOrderConflict(cp *gpuv1.ClusterPolicy, gc *nvidiav1alpha1.GPUCluster) bool {
+	return cp != nil && gc != nil && !cp.CreationTimestamp.Before(&gc.CreationTimestamp)
+}
+
+// resolveActiveConfig returns the singleton ClusterPolicy if its creation order is
+// eligible, and the GPUCluster. All configuration consumers use the same backstop.
 func resolveActiveConfig(ctx context.Context, c client.Reader) (*gpuv1.ClusterPolicy, *nvidiav1alpha1.GPUCluster, error) {
 	clusterPolicies := &gpuv1.ClusterPolicyList{}
 	if err := c.List(ctx, clusterPolicies); err != nil {
@@ -69,5 +75,9 @@ func resolveActiveConfig(ctx context.Context, c client.Reader) (*gpuv1.ClusterPo
 		gpuCluster = &gpuClusters.Items[0]
 	}
 
-	return getSingletonClusterPolicy(clusterPolicies.Items), gpuCluster, nil
+	clusterPolicy := getSingletonClusterPolicy(clusterPolicies.Items)
+	if clusterPolicyCreationOrderConflict(clusterPolicy, gpuCluster) {
+		clusterPolicy = nil
+	}
+	return clusterPolicy, gpuCluster, nil
 }
