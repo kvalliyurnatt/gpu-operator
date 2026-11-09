@@ -20,6 +20,7 @@ import (
 	"context"
 	"sort"
 	"testing"
+	"time"
 
 	promcli "github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -78,9 +79,11 @@ type fakeStateManager struct {
 	state.Manager
 	results     state.Results
 	lastCatalog state.InfoCatalog
+	syncCalls   int
 }
 
 func (f *fakeStateManager) SyncState(_ context.Context, _ any, catalog state.InfoCatalog) state.Results {
+	f.syncCalls++
 	f.lastCatalog = catalog
 	return f.results
 }
@@ -105,7 +108,7 @@ func gccState(t *testing.T, c client.Client, name string) nvidiav1alpha1.State {
 // Empty state set, so SyncState reports ready.
 func TestGPUClusterReconcileReady(t *testing.T) {
 	cfg := &nvidiav1alpha1.GPUCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "config"},
+		ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
 	}
 	r, c := newGPUClusterReconciler(t, cfg)
 
@@ -120,7 +123,7 @@ func TestGPUClusterReconcileReady(t *testing.T) {
 // Operand states that are not ready without an error are named in the OperandNotReady condition.
 func TestGPUClusterReconcileOperandNotReady(t *testing.T) {
 	cfg := &nvidiav1alpha1.GPUCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "config"},
+		ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
 	}
 	r, c := newGPUClusterReconciler(t, cfg)
 	r.stateManager = &fakeStateManager{results: state.Results{
@@ -143,7 +146,7 @@ func TestGPUClusterReconcileOperandNotReady(t *testing.T) {
 // The GPUCluster path sets the same GPU node gauge as the ClusterPolicy path.
 func TestGPUClusterReconcileRecordsGPUNodeCount(t *testing.T) {
 	cfg := &nvidiav1alpha1.GPUCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "config"},
+		ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
 	}
 	gpuNode := func(name string) *corev1.Node {
 		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{
@@ -164,7 +167,7 @@ func TestGPUClusterReconcileRecordsGPUNodeCount(t *testing.T) {
 // before any state is synced.
 func TestGPUClusterReconcileRecordsGPUNodeCountWithConflict(t *testing.T) {
 	cfg := &nvidiav1alpha1.GPUCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "config"},
+		ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))},
 	}
 	cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
 	gpuNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
@@ -226,7 +229,7 @@ func TestGPUClusterOperandNotReadyMessage(t *testing.T) {
 }
 
 func TestGPUClusterReconcileLabelsNamespaceForAdminAccess(t *testing.T) {
-	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))}}
 	r, c := newGPUClusterReconciler(t, cfg)
 
 	gccReconcile(t, r, cfg.Name)
@@ -245,7 +248,7 @@ func TestGPUClusterReconcileNotFound(t *testing.T) {
 }
 
 func TestGPUClusterReconcileAddsFinalizer(t *testing.T) {
-	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))}}
 	r, c := newGPUClusterReconciler(t, cfg)
 
 	gccReconcile(t, r, cfg.Name)
@@ -326,7 +329,7 @@ func TestGPUClusterTeardownDrainsClaimConsumersFirst(t *testing.T) {
 
 // A ClusterPolicy and GPUCluster CR cannot co-exist
 func TestGPUClusterCoexistsWithClusterPolicy(t *testing.T) {
-	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+	cfg := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))}}
 	cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
 	r, c := newGPUClusterReconciler(t, cfg, cp)
 

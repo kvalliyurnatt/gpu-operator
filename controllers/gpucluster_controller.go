@@ -36,7 +36,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -72,7 +71,7 @@ type GPUClusterReconciler struct {
 //+kubebuilder:rbac:groups=nvidia.com,resources=gpuclusters,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=nvidia.com,resources=gpuclusters/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=nvidia.com,resources=gpuclusters/finalizers,verbs=update
-//+kubebuilder:rbac:groups=nvidia.com,resources=clusterpolicies,verbs=get;list;watch
+//+kubebuilder:rbac:groups=nvidia.com,resources=clusterpolicies,verbs=get;list;watch;patch
 //+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;update;patch
 //+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaimtemplates,verbs=get;list;watch;create;update;delete
@@ -104,17 +103,56 @@ func (r *GPUClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("error adding finalizer to GPUCluster %s: %w", req.NamespacedName, err)
 	}
 
-	if msg, err := r.validatePrerequisites(ctx); err != nil {
+	if reason, msg, err := r.validatePrerequisites(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	} else if msg != "" {
 		logger.V(consts.LogLevelWarning).Info("GPUCluster prerequisite not met", "reason", msg)
 		if err := r.updateCRStatus(ctx, instance, nvidiav1alpha1.NotReady); err != nil {
 			return ctrl.Result{}, err
 		}
-		if condErr := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.PrerequisiteNotMet, msg); condErr != nil {
-			logger.Error(condErr, "failed to set condition")
+		if err := r.conditionUpdater.SetConditionsError(ctx, instance, reason, msg); err != nil {
+			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+	cp, _, err := resolveActiveConfig(ctx, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if cp != nil && (!coexistenceInitialized(instance) || !participates(instance) || !participates(cp)) {
+		// Until initialization, node labeling still adopts unassigned GPU nodes for CP.
+		// Observe those selections before enabling the new-node DRA preference.
+		if pending, err := allocatorInitializationPending(ctx, r.Client); err != nil {
+			_ = r.updateCRStatus(ctx, instance, nvidiav1alpha1.NotReady)
+			_ = r.conditionUpdater.SetConditionsError(ctx, instance, conditions.ReconcileFailed, err.Error())
+			return ctrl.Result{}, err
+		} else if pending {
+			if err := r.updateCRStatus(ctx, instance, nvidiav1alpha1.NotReady); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.NodeAdoptionPending, "Waiting for existing discovered GPU nodes to record their allocator selections before enabling coexistence"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		observed, err := r.observeParticipation(ctx, cp, instance)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !observed {
+			if err := r.updateCRStatus(ctx, instance, nvidiav1alpha1.NotReady); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.CoexistenceInitializationPending, "Waiting to observe coexistence annotations on both source CRs"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		if err := r.initializeCoexistence(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Observe the persisted decision before subsequent status updates or operand sync.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	// The operand states render ResourceClaimTemplates with adminAccess: true, which the
@@ -127,6 +165,20 @@ func (r *GPUClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	infoCatalog.Add(state.InfoTypeClusterInfo, r.ClusterInfo)
 
 	managerStatus := r.stateManager.SyncState(ctx, instance, infoCatalog)
+
+	if pending, err := allocatorInitializationPending(ctx, r.Client); err != nil {
+		_ = r.updateCRStatus(ctx, instance, nvidiav1alpha1.NotReady)
+		_ = r.conditionUpdater.SetConditionsError(ctx, instance, conditions.ReconcileFailed, err.Error())
+		return ctrl.Result{}, err
+	} else if pending && managerStatus.Status == state.SyncStateReady {
+		if err := r.updateCRStatus(ctx, instance, nvidiav1alpha1.NotReady); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.OperandNotReady, "Waiting for allocator selection initialization"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 
 	if err := r.updateCRStatus(ctx, instance, nvidiav1alpha1.State(managerStatus.Status)); err != nil {
 		return ctrl.Result{}, err
@@ -191,18 +243,29 @@ func gpuClusterOperandNotReadyMessage(results []state.Result) string {
 	return msg
 }
 
-// validatePrerequisites checks the cross-CR rules that gate DRA enablement, returning
-// a message describing the first unmet prerequisite or an empty string when all are met.
-func (r *GPUClusterReconciler) validatePrerequisites(ctx context.Context) (string, error) {
-	clusterPolicies := &gpuv1.ClusterPolicyList{}
-	if err := r.List(ctx, clusterPolicies); err != nil {
-		return "", fmt.Errorf("error listing ClusterPolicy objects: %w", err)
+// validatePrerequisites returns the reason and message for the first unmet cross-CR prerequisite.
+func (r *GPUClusterReconciler) validatePrerequisites(ctx context.Context, instance *nvidiav1alpha1.GPUCluster) (string, string, error) {
+	// Unlike placement resolution, validation must see an out-of-order CP so
+	// a cache-window admission race is reported instead of treated as standalone.
+	list := &gpuv1.ClusterPolicyList{}
+	if err := r.List(ctx, list); err != nil {
+		return "", "", err
 	}
-	// TODO: relax this prerequisite once ClusterPolicy and GPUCluster can co-exist
-	if clusterPolicy := getSingletonClusterPolicy(clusterPolicies.Items); clusterPolicy != nil {
-		return fmt.Sprintf("A ClusterPolicy CR %q exists; a ClusterPolicy CR and GPUCluster CR may not exist at the same time", clusterPolicy.Name), nil
+	cp := getSingletonClusterPolicy(list.Items)
+	if cp != nil {
+		if !cp.CreationTimestamp.Before(&instance.CreationTimestamp) {
+			return conditions.PrerequisiteNotMet, "InvalidSourceOrder: ClusterPolicy must predate GPUCluster", nil
+		}
+		if !coexistenceInitialized(instance) && !cp.DeletionTimestamp.IsZero() {
+			return conditions.ClusterPolicyRequired, "Wait for ClusterPolicy deletion to complete before creating a standalone GPUCluster", nil
+		}
+		if cp.Spec.Driver.IsEnabled() && !cp.Spec.Driver.UseNvidiaDriverCRDType() {
+			return conditions.PrerequisiteNotMet, "Coexistence requires independent NVIDIADriver ownership or host-installed drivers", nil
+		}
+	} else if participates(instance) && !coexistenceInitialized(instance) {
+		return conditions.CoexistenceInitializationPending, "Coexistence initialization was interrupted before the ClusterPolicy disappeared", nil
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // ensureAdminAccessLabel patches the operator namespace with the label required by the
@@ -349,13 +412,18 @@ func (r *GPUClusterReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Ma
 		mgr.GetCache(),
 		&nvidiav1alpha1.GPUCluster{},
 		handler.TypedEnqueueRequestsFromMapFunc(r.enqueueAllGPUClusters),
-		predicate.TypedGenerationChangedPredicate[*nvidiav1alpha1.GPUCluster]{},
+		gpuClusterAllocationPredicate(),
 	),
 	)
 	if err != nil {
 		return err
 	}
 
+	if err := c.Watch(source.Kind(mgr.GetCache(), &gpuv1.ClusterPolicy{}, handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, _ *gpuv1.ClusterPolicy) []reconcile.Request {
+		return r.enqueueAllGPUClusters(ctx, nil)
+	}))); err != nil {
+		return err
+	}
 	// Watch the secondary resources each state manager owns.
 	watchSources := stateManager.GetWatchSources(mgr)
 	for _, watchSource := range watchSources {

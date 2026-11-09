@@ -22,6 +22,7 @@ import (
 	"errors"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
@@ -206,7 +207,7 @@ func TestReconcile(t *testing.T) {
 			// Initialize fake client with ClusterPolicy (driver optional)
 			clientBuilder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cp, driver)
 			if tc.gpuClusterExists {
-				gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config"}}
+				gc := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))}}
 				clientBuilder = clientBuilder.WithObjects(gc)
 			}
 			client := clientBuilder.Build()

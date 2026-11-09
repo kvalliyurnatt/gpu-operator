@@ -86,6 +86,11 @@ operator:
   imagePullSecrets: []
   # leaderElection:
   #   renewDeadline: 60s
+  # DEFAULT_GPU_ALLOCATION_STACK: device-plugin (default) or dra.
+  # Applies to new, unassigned nodes during coexistence, including when one
+  # participating CR remains. Existing selections and ordinary single-stack
+  # installations are unchanged. In OLM use Subscription.spec.config.env.
+  # Example: [{name: DEFAULT_GPU_ALLOCATION_STACK, value: dra}]
   env: []
   priorityClassName: system-node-critical
   runtimeClass: nvidia
@@ -607,7 +612,8 @@ clusterPolicy:
 #
 # To enable the GPUCluster (DRA) enablement stack, set
 # gpuCluster.deployCR=true and clusterPolicy.deployCR=false
-# It is an invalid configuration for both CRs to exist.
+# To add GPUCluster to an existing ClusterPolicy, first configure independent drivers.
+# Coexistence is initialized automatically; no GPUCluster spec opt-in is required.
 gpuCluster:
   deployCR: false
 

@@ -40,7 +40,7 @@ func TestResolveActiveConfig(t *testing.T) {
 	require.NoError(t, nvidiav1alpha1.AddToScheme(scheme))
 
 	clusterPolicy := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{Name: "cluster-policy"}}
-	gpuCluster := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster-config"}}
+	gpuCluster := &nvidiav1alpha1.GPUCluster{ObjectMeta: metav1.ObjectMeta{Name: "cluster-config", CreationTimestamp: metav1.NewTime(time.Unix(2, 0))}}
 
 	t.Run("both CRs present are both returned", func(t *testing.T) {
 		c := fake.NewClientBuilder().WithScheme(scheme).

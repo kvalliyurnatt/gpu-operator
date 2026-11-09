@@ -34,4 +34,10 @@ const (
 	DriverNotReady = "DriverNotReady"
 	// PrerequisiteNotMet indicates that a configuration prerequisite for reconciliation has not been met
 	PrerequisiteNotMet = "PrerequisiteNotMet"
+	// ClusterPolicyRequired indicates that coexistence cannot initialize without an active ClusterPolicy.
+	ClusterPolicyRequired = "ClusterPolicyRequired"
+	// NodeAdoptionPending indicates that existing GPU node selections must be recorded before coexistence initializes.
+	NodeAdoptionPending = "NodeAdoptionPending"
+	// CoexistenceInitializationPending indicates participation metadata is not yet observed.
+	CoexistenceInitializationPending = "CoexistenceInitializationPending"
 )

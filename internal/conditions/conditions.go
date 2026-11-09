@@ -25,6 +25,8 @@ const (
 	Ready = "Ready"
 	// Error condition type indicates one or more of the resources managed by the controller are in error state
 	Error = "Error"
+	// CoexistenceInitialized records that GPUCluster passed its initial coexistence prerequisites.
+	CoexistenceInitialized = "CoexistenceInitialized"
 )
 
 // Updater interface

@@ -69,5 +69,9 @@ func resolveActiveConfig(ctx context.Context, c client.Reader) (*gpuv1.ClusterPo
 		gpuCluster = &gpuClusters.Items[0]
 	}
 
-	return getSingletonClusterPolicy(clusterPolicies.Items), gpuCluster, nil
+	cp := getSingletonClusterPolicy(clusterPolicies.Items)
+	if cp != nil && gpuCluster != nil && !cp.CreationTimestamp.Before(&gpuCluster.CreationTimestamp) {
+		cp = nil
+	}
+	return cp, gpuCluster, nil
 }
