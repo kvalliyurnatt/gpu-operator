@@ -255,12 +255,25 @@ func TestCoexistenceWaitsForNodeAdoption(t *testing.T) {
 	require.NoError(t, c.Create(t.Context(), before))
 	assertPending()
 	labelNodes()
+	// The first participation write follows adoption. From this point the default
+	// selects new nodes, even while the second write and activation are pending.
+	gccReconcile(t, r, gc.Name)
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(gc), gc))
+	require.True(t, participates(gc))
+	require.False(t, coexistenceInitialized(gc))
+	afterAdoption := node("after-adoption-before-activation")
+	require.NoError(t, c.Create(t.Context(), afterAdoption))
+	labelNodes()
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(afterAdoption), afterAdoption))
+	require.Equal(t, coexistence.DRA, afterAdoption.Annotations[coexistence.SelectionAnnotation])
+	require.NotContains(t, afterAdoption.Labels, draDriverDeployLabelKey)
+	require.NotContains(t, afterAdoption.Labels, "nvidia.com/gpu.deploy.device-plugin")
 	initializeForTest(t, r, gc)
 	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(gc), gc))
 	require.True(t, coexistenceInitialized(gc))
 	require.Zero(t, manager.syncCalls)
 
-	// The DRA preference starts at initialization; recorded DP selections survive.
+	// Recorded DP selections survive after activation enables the DRA stack.
 	after := node("after-initialization")
 	require.NoError(t, c.Create(t.Context(), after))
 	labelNodes()
@@ -270,7 +283,7 @@ func TestCoexistenceWaitsForNodeAdoption(t *testing.T) {
 		require.Equal(t, "true", n.Labels["nvidia.com/gpu.deploy.device-plugin"])
 		require.NotContains(t, n.Labels, draDriverDeployLabelKey)
 	}
-	for _, n := range []*corev1.Node{explicit, after} {
+	for _, n := range []*corev1.Node{explicit, afterAdoption, after} {
 		require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(n), n))
 		require.Equal(t, coexistence.DRA, n.Annotations[coexistence.SelectionAnnotation])
 		require.Equal(t, "true", n.Labels[draDriverDeployLabelKey])
@@ -278,6 +291,75 @@ func TestCoexistenceWaitsForNodeAdoption(t *testing.T) {
 	gccReconcile(t, r, gc.Name)
 	require.Equal(t, 1, manager.syncCalls)
 	require.Equal(t, gpu.Ready, gccState(t, c, gc.Name))
+}
+
+func TestCoexistenceRecreationPreservesDefaultBeforeActivation(t *testing.T) {
+	for _, defaultStack := range []string{coexistence.DP, coexistence.DRA} {
+		t.Run(defaultStack, func(t *testing.T) {
+			t.Setenv(coexistence.DefaultStackEnv, defaultStack)
+			cp := &gpuv1.ClusterPolicy{ObjectMeta: metav1.ObjectMeta{
+				Name: "cp", Annotations: map[string]string{coexistence.ParticipationAnnotation: "true"},
+			}}
+			cp.Spec.Driver.Enabled = new(false)
+			node := func(name, selected string) *corev1.Node {
+				n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
+					commonGPULabelKey: "true", "feature.node.kubernetes.io/pci-10de.present": "true",
+				}}}
+				if selected != "" {
+					n.Annotations = map[string]string{coexistence.SelectionAnnotation: selected}
+				}
+				return n
+			}
+			dp, dra := node("existing-dp", coexistence.DP), node("existing-dra", coexistence.DRA)
+			absent := node("joined-while-absent", "")
+			r, c := newGPUClusterReconciler(t, cp, dp, dra, absent)
+			nlc := &NodeLabelingReconciler{Client: c, Scheme: r.Scheme, Namespace: r.Namespace}
+			check := func(n *corev1.Node, selected string, active bool) {
+				t.Helper()
+				require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(n), n))
+				require.Equal(t, selected, n.Annotations[coexistence.SelectionAnnotation])
+				require.Equal(t, selected == coexistence.DP, n.Labels["nvidia.com/gpu.deploy.device-plugin"] == "true")
+				require.Equal(t, selected == coexistence.DRA && active, n.Labels[draDriverDeployLabelKey] == "true")
+			}
+			label := func() {
+				t.Helper()
+				_, err := nlc.Reconcile(t.Context(), ctrl.Request{})
+				require.NoError(t, err)
+			}
+			label()
+			check(absent, defaultStack, false)
+
+			// The replacement has neither participation metadata nor initialization status.
+			gc := coexistenceConfig()
+			require.NoError(t, c.Create(t.Context(), gc))
+			before := node("joined-before-initialization", "")
+			require.NoError(t, c.Create(t.Context(), before))
+			label()
+			check(before, defaultStack, false)
+			check(dp, coexistence.DP, false)
+			check(dra, coexistence.DRA, false)
+			require.Nil(t, gpuClusterForAllocation(cp, gc))
+
+			// Observing the replacement's annotation still must not activate DRA early.
+			gccReconcile(t, r, gc.Name)
+			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(gc), gc))
+			require.True(t, participates(gc))
+			require.False(t, coexistenceInitialized(gc))
+			between := node("joined-before-activation", "")
+			require.NoError(t, c.Create(t.Context(), between))
+			label()
+			check(between, defaultStack, false)
+			require.Zero(t, r.stateManager.(*fakeStateManager).syncCalls)
+
+			initializeForTest(t, r, gc)
+			label()
+			for _, n := range []*corev1.Node{absent, before, between} {
+				check(n, defaultStack, true)
+			}
+			check(dp, coexistence.DP, true)
+			check(dra, coexistence.DRA, true)
+		})
+	}
 }
 
 func TestCoexistenceAdoptionListFailurePreventsInitialization(t *testing.T) {

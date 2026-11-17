@@ -63,10 +63,9 @@ func participates(obj client.Object) bool {
 func allocationPolicy(cp *gpuv1.ClusterPolicy, gc *nvidiav1alpha1.GPUCluster) (bool, string, error) {
 	defaultStack, err := coexistence.DefaultStack()
 	preserve := (cp != nil && participates(cp)) || (gc != nil && participates(gc))
-	// Before initialization, adopt visible nodes under CP rather than the new default.
-	if cp != nil && gc != nil && !coexistenceInitialized(gc) {
-		defaultStack = coexistence.DP
-	}
+	// Before participation is recorded, ordinary CP selection adopts existing nodes.
+	// After adoption, initialization gates activation, not the default for new nodes.
+	// A replacement GPUCluster must not change that default while it initializes.
 	return preserve, defaultStack, err
 }
 

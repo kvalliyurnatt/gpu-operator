@@ -120,8 +120,9 @@ func (r *GPUClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 	if cp != nil && (!coexistenceInitialized(instance) || !participates(instance) || !participates(cp)) {
-		// Until initialization, node labeling still adopts unassigned GPU nodes for CP.
-		// Observe those selections before enabling the new-node DRA preference.
+		// First-time adoption uses CP until participation is recorded. A surviving
+		// participation annotation preserves selection policy during peer recreation.
+		// Neither path permits DRA activation before initialization is observed.
 		if pending, err := allocatorInitializationPending(ctx, r.Client); err != nil {
 			_ = r.updateCRStatus(ctx, instance, nvidiav1alpha1.NotReady)
 			_ = r.conditionUpdater.SetConditionsError(ctx, instance, conditions.ReconcileFailed, err.Error())
