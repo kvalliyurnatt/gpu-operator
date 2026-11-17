@@ -1,7 +1,3 @@
-{{- if and .Values.clusterPolicy.deployCR .Values.gpuCluster.deployCR }}
-{{ fail "clusterPolicy.deployCR and gpuCluster.deployCR cannot both be true; only one CR can exist" }}
-{{- end }}
-
 {{- if and .Values.gpuCluster.deployCR (and .Values.driver.enabled (not .Values.driver.nvidiaDriverCRD.enabled)) }}
 {{ fail "the NVIDIADriver CRD must be enabled when deploying a GPUCluster CR, set driver.nvidiaDriverCRD.enabled=true" }}
 {{- end }}
@@ -26,5 +22,16 @@
 {{- $clusterSupportsDRA := or (.Capabilities.APIVersions.Has "resource.k8s.io/v1/DeviceClass") (.Capabilities.APIVersions.Has "resource.k8s.io/v1beta2/DeviceClass") (.Capabilities.APIVersions.Has "resource.k8s.io/v1beta1/DeviceClass") }}
 {{- if not $clusterSupportsDRA }}
 {{ fail "gpuCluster.deployCR=true requires a Kubernetes cluster that supports Dynamic Resource Allocation (no resource.k8s.io DeviceClass API is served). When rendering offline with 'helm template', pass --api-versions resource.k8s.io/v1/DeviceClass" }}
+{{- end }}
+{{- end }}
+
+{{- if ne .Values.operator.defaultGPUAllocationStack nil }}
+{{- if not (has .Values.operator.defaultGPUAllocationStack (list "device-plugin" "dra")) }}
+{{ fail "operator.defaultGPUAllocationStack must be null, device-plugin, or dra" }}
+{{- end }}
+{{- end }}
+{{- range .Values.operator.env }}
+{{- if eq .name "DEFAULT_GPU_ALLOCATION_STACK" }}
+{{ fail "use operator.defaultGPUAllocationStack instead of operator.env for DEFAULT_GPU_ALLOCATION_STACK" }}
 {{- end }}
 {{- end }}

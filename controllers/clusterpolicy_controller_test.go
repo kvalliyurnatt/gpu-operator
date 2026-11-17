@@ -452,7 +452,7 @@ func TestClusterPolicyBlockedByGPUCluster(t *testing.T) {
 
 	_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cp)})
 	require.Equal(t, gpuv1.NotReady, clusterPolicyState(t, c, cp.Name))
-	require.ErrorContains(t, err, "ClusterPolicy and GPUCluster cannot co-exist")
+	require.ErrorContains(t, err, "ClusterPolicy must be created before GPUCluster")
 
 	// Deleting the GPUCluster instance unblocks the next reconcile
 	require.NoError(t, c.Delete(t.Context(), gc))
@@ -468,6 +468,9 @@ func newClusterPolicyUpgradeTestReconciler(t *testing.T, cp *gpuv1.ClusterPolicy
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, nvidiav1alpha1.AddToScheme(scheme))
 
+	// These tests exercise driver-upgrade readiness after initial adoption.
+	cp.Finalizers = []string{nodeCleanupFinalizer}
+	cp.Status.Conditions = []metav1.Condition{{Type: nodeSelectionInitialized, Status: metav1.ConditionTrue, Reason: "AdoptionComplete"}}
 	objects := []client.Object{cp}
 	for _, node := range nodes {
 		objects = append(objects, node)

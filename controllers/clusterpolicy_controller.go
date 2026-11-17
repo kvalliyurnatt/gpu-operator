@@ -120,6 +120,10 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return reconcile.Result{}, err
 	}
 
+	if !instance.DeletionTimestamp.IsZero() {
+		return teardownSourceOperands(ctx, r.Client, r.Namespace, instance)
+	}
+
 	// The ClusterPolicy with the oldest creationTimestamp (name as tie-breaker) is
 	// treated as the singleton, so the choice is stable across operator restarts and
 	// derivable by other controllers (see getSingletonClusterPolicy).
@@ -134,20 +138,31 @@ func (r *ClusterPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	// TODO: remove the below code block once both ClusterPolicy and GPUCluster can co-exist
+	// Cached backstop for CP-first creation; equal timestamps do not establish ordering.
 	gpuClusters := &nvidiav1alpha1.GPUClusterList{}
 	if err := r.List(ctx, gpuClusters); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to list GPUCluster objects: %w", err)
 	}
-	if len(gpuClusters.Items) > 0 {
-		err := fmt.Errorf("conflicting GPUCluster resource %q detected; ClusterPolicy and GPUCluster cannot co-exist", gpuClusters.Items[0].Name)
-		logger.Error(err, "only one CR may be present at a time")
+	if len(gpuClusters.Items) > 0 && !instance.CreationTimestamp.Before(&gpuClusters.Items[0].CreationTimestamp) {
+		err := fmt.Errorf("GPUCluster resource %q exists; ClusterPolicy must be created before GPUCluster", gpuClusters.Items[0].Name)
+		logger.Error(err, "ClusterPolicy must be created before GPUCluster")
 		updateCRState(ctx, r, req.NamespacedName, gpuv1.NotReady)
 		if condErr := r.conditionUpdater.SetConditionsError(ctx, instance, conditions.ReconcileFailed, err.Error()); condErr != nil {
 			logger.Error(condErr, "failed to set condition")
 		}
 		clusterPolicyCtrl.operatorMetrics.reconciliationStatus.Set(reconciliationStatusClusterPolicyUnavailable)
 		return ctrl.Result{}, err
+	}
+
+	if registered, err := registerNodeCleanup(ctx, r.Client, instance); err != nil {
+		return ctrl.Result{}, err
+	} else if !registered {
+		return ctrl.Result{RequeueAfter: lifecycleRetry}, nil
+	}
+	if adopted, err := observeSourceAdoption(ctx, r.Client, instance); err != nil {
+		return ctrl.Result{}, err
+	} else if !adopted {
+		return ctrl.Result{RequeueAfter: lifecycleRetry}, nil
 	}
 
 	if err := clusterPolicyCtrl.init(ctx, r, instance); err != nil {
@@ -471,7 +486,7 @@ func (r *ClusterPolicyReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		mgr.GetCache(),
 		&gpuv1.ClusterPolicy{},
 		&handler.TypedEnqueueRequestForObject[*gpuv1.ClusterPolicy]{},
-		predicate.TypedGenerationChangedPredicate[*gpuv1.ClusterPolicy]{},
+		singletonCRPredicate[*gpuv1.ClusterPolicy](),
 	),
 	)
 	if err != nil {
@@ -499,6 +514,11 @@ func (r *ClusterPolicyReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		return err
 	}
 
+	// Deployment removal is part of source teardown (notably the DRA controller).
+	if err := c.Watch(source.Kind(mgr.GetCache(), &appsv1.Deployment{}, handler.TypedEnqueueRequestForOwner[*appsv1.Deployment](mgr.GetScheme(), mgr.GetRESTMapper(), &gpuv1.ClusterPolicy{}, handler.OnlyControllerOwner()))); err != nil {
+		return err
+	}
+
 	// Watch GPUCluster: its existence gates the resource-allocation mode nodeSelector on operands.
 	gpuClusterMapFn := func(ctx context.Context, _ *nvidiav1alpha1.GPUCluster) []reconcile.Request {
 		return r.enqueueAllClusterPolicies(ctx)
@@ -507,7 +527,7 @@ func (r *ClusterPolicyReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 		mgr.GetCache(),
 		&nvidiav1alpha1.GPUCluster{},
 		handler.TypedEnqueueRequestsFromMapFunc(gpuClusterMapFn),
-		predicate.TypedGenerationChangedPredicate[*nvidiav1alpha1.GPUCluster]{},
+		singletonCRPredicate[*nvidiav1alpha1.GPUCluster](),
 	))
 	if err != nil {
 		return err
