@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	gpuv1 "github.com/NVIDIA/gpu-operator/api/nvidia/v1"
+	gpu "github.com/NVIDIA/gpu-operator/api/nvidia/v1alpha1"
 	"github.com/NVIDIA/gpu-operator/internal/coexistence"
 	"github.com/NVIDIA/gpu-operator/internal/consts"
 )
@@ -242,6 +243,26 @@ func TestAdoptionConditionIsObservedAndLatched(t *testing.T) {
 	ready, err = observeSourceAdoption(t.Context(), c, actual)
 	require.NoError(t, err)
 	require.True(t, ready)
+}
+
+func TestGPUClusterAdoptionInitializesRequiredState(t *testing.T) {
+	for _, initial := range []gpu.State{"", gpu.Ready} {
+		t.Run(string(initial), func(t *testing.T) {
+			gc := testSourceGC()
+			gc.Status.State = initial
+			c := lifecycleClient(t, gc)
+			observed, err := observeSourceAdoption(t.Context(), c, gc)
+			require.NoError(t, err)
+			require.False(t, observed)
+			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(gc), gc))
+			require.True(t, sourceConditionTrue(gc, nodeSelectionInitialized))
+			if initial == "" {
+				require.Equal(t, gpu.NotReady, gc.Status.State, "the CRD requires state on the first status write")
+			} else {
+				require.Equal(t, initial, gc.Status.State)
+			}
+		})
+	}
 }
 
 func TestModeCannotBypassTerminatingSource(t *testing.T) {

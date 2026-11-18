@@ -81,6 +81,17 @@ func sourceConditionsChanged(a, b client.Object) bool {
 // Source controllers alone call this helper; the node-label controller only reads status.
 func setSourceCondition(ctx context.Context, c client.Client, obj client.Object, name string, value bool, reason, message string) error {
 	original := obj.DeepCopyObject().(client.Object)
+	// Adoption can be the first status write; the GPUCluster schema requires state.
+	switch o := obj.(type) {
+	case *gpuv1.ClusterPolicy:
+		if o.Status.State == "" {
+			o.Status.State = gpuv1.NotReady
+		}
+	case *gpu.GPUCluster:
+		if o.Status.State == "" {
+			o.Status.State = gpu.NotReady
+		}
+	}
 	status := metav1.ConditionFalse
 	if value {
 		status = metav1.ConditionTrue
